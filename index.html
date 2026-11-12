@@ -1,0 +1,1277 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>RANA - Penjaga Rimba Baja</title>
+<style>
+  html,body{margin:0;height:100%;background:#020a0e;overflow:hidden;touch-action:none;
+    -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
+  canvas{position:absolute;image-rendering:pixelated;image-rendering:crisp-edges;background:#000}
+  #touch{display:none;position:fixed;inset:0;pointer-events:none;font:bold 2.6vmin monospace;color:#cffff2}
+  #touch.on{display:block}
+  .tb{position:absolute;pointer-events:auto;width:17vmin;height:17vmin;border-radius:50%;
+    background:rgba(31,200,168,.16);border:.5vmin solid rgba(143,245,220,.45);
+    display:flex;align-items:center;justify-content:center;box-sizing:border-box}
+  .tb.sm{width:11vmin;height:8vmin;border-radius:2vmin;font-size:2.2vmin}
+  .tb.act{background:rgba(143,245,220,.5)}
+  .tb.ar{font-size:6vmin}
+</style>
+</head>
+<body>
+<canvas id="game" width="384" height="216"></canvas>
+
+<!-- Tombol sentuh untuk HP -->
+<div id="touch">
+  <div class="tb ar" data-act="left"  style="left:3vmin;bottom:6vmin">&#9664;</div>
+  <div class="tb ar" data-act="right" style="left:23vmin;bottom:6vmin">&#9654;</div>
+  <div class="tb" data-act="shoot" style="right:23vmin;bottom:5vmin">TEMBAK</div>
+  <div class="tb" data-act="jump"  style="right:3vmin;bottom:9vmin">LOMPAT</div>
+  <div class="tb" data-act="dash"  style="right:14vmin;bottom:25vmin">DASH</div>
+  <div class="tb sm" data-act="pause" style="left:calc(50% - 12vmin);top:2vmin">PAUSE</div>
+  <div class="tb sm" data-act="wnext" style="left:calc(50% + 1vmin);top:2vmin">SENJATA</div>
+</div>
+
+<script>
+'use strict';
+/* =====================================================================
+   RANA - PENJAGA RIMBA BAJA
+   Demo platformer aksi 2D. Satu file, Canvas + JavaScript murni.
+   Semua karakter, cerita, grafis, dan musik orisinal dibuat dengan kode.
+   ===================================================================== */
+
+/* ---------------------------------------------------------------------
+   1. KONSTANTA & SETUP KANVAS
+   --------------------------------------------------------------------- */
+const W = 384, H = 216, TS = 16;          // resolusi internal & ukuran tile
+const LW = 201, LH = 18;                  // ukuran level dalam tile
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+const isTouch = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+if (isTouch) document.getElementById('touch').classList.add('on');
+
+// Skala pixel-perfect: kelipatan bulat dalam piksel fisik layar
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  let k = Math.floor(Math.min(innerWidth * dpr / W, innerHeight * dpr / H));
+  let cw, ch;
+  if (k >= 1) { cw = W * k / dpr; ch = H * k / dpr; }
+  else { const s = Math.min(innerWidth / W, innerHeight / H); cw = W * s; ch = H * s; }
+  const portrait = innerHeight > innerWidth;
+  const left = Math.round((innerWidth - cw) / 2 * dpr) / dpr;
+  const top = (isTouch && portrait) ? Math.round(10 * dpr) / dpr : Math.round((innerHeight - ch) / 2 * dpr) / dpr;
+  canvas.style.width = cw + 'px'; canvas.style.height = ch + 'px';
+  canvas.style.left = left + 'px'; canvas.style.top = top + 'px';
+}
+addEventListener('resize', resize); resize();
+
+// Fisika (piksel per frame @60 FPS)
+const GRAV = 0.25, MAXFALL = 5.75, JUMP = 5.1, RUN = 1.5, DASH = 3.5;
+const CH1 = 35, CH2 = 95;                 // ambang charge tingkat 1 & 2
+// Arena boss
+const DOOR_COL = 177;
+const ROOM_L = 178 * TS, ROOM_R = 200 * TS, FLOOR = 15 * TS, CEIL = 6 * TS;
+const BOSS_CAM = DOOR_COL * TS;
+
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const mod = (a, n) => ((a % n) + n) % n;
+const rnd = (a, b) => a + Math.random() * (b - a);
+const overlap = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+
+/* ---------------------------------------------------------------------
+   2. INPUT (KEYBOARD + SENTUH)
+   --------------------------------------------------------------------- */
+const ACTIONS = ['left', 'right', 'up', 'down', 'jump', 'shoot', 'dash', 'pause', 'wprev', 'wnext'];
+const KEYMAP = {
+  ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right',
+  ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down',
+  KeyZ: 'jump', Space: 'jump', KeyX: 'shoot',
+  KeyC: 'dash', ShiftLeft: 'dash', ShiftRight: 'dash',
+  Enter: 'pause', KeyQ: 'wprev', KeyE: 'wnext'
+};
+const codesDown = {}, touchDown = {}, queue = {};
+const held = {}, pressed = {};
+
+function keyHeld(a) { for (const c in KEYMAP) if (KEYMAP[c] === a && codesDown[c]) return true; return false; }
+addEventListener('keydown', e => {
+  audioInit();
+  if (e.code === 'KeyM' && !e.repeat) toggleMute();
+  const a = KEYMAP[e.code]; if (!a) return;
+  e.preventDefault();
+  if (!e.repeat && !codesDown[e.code]) queue[a] = true;
+  codesDown[e.code] = true;
+});
+addEventListener('keyup', e => { if (KEYMAP[e.code]) { codesDown[e.code] = false; e.preventDefault(); } });
+addEventListener('blur', () => { for (const c in codesDown) codesDown[c] = false; autoPause(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden) autoPause(); });
+
+// Sentuh: pindai semua jari, cocokkan dengan tombol di bawahnya (bisa digeser antar tombol)
+function scanTouches(ev) {
+  ev.preventDefault(); audioInit();
+  const now = {};
+  for (const t of ev.touches) {
+    const el = document.elementFromPoint(t.clientX, t.clientY);
+    const a = el && el.dataset && el.dataset.act;
+    if (a) now[a] = true;
+  }
+  for (const a of ACTIONS) { if (now[a] && !touchDown[a]) queue[a] = true; touchDown[a] = !!now[a]; }
+  document.querySelectorAll('.tb').forEach(b => b.classList.toggle('act', !!now[b.dataset.act]));
+  // Ketuk kanvas di layar menu = konfirmasi
+  if (ev.type === 'touchstart' && ev.target === canvas && state !== 'play') queue.pause = true;
+}
+['touchstart', 'touchmove', 'touchend', 'touchcancel'].forEach(n =>
+  document.addEventListener(n, scanTouches, { passive: false }));
+canvas.addEventListener('mousedown', () => { audioInit(); if (state === 'title') queue.pause = true; });
+
+function pollInput() {
+  for (const a of ACTIONS) {
+    pressed[a] = !!queue[a];
+    held[a] = keyHeld(a) || !!touchDown[a] || pressed[a];
+    queue[a] = false;
+  }
+}
+const anyConfirm = () => pressed.pause || pressed.jump || pressed.shoot;
+
+/* ---------------------------------------------------------------------
+   3. AUDIO: EFEK SUARA RETRO + MUSIK CHIPTUNE (WEB AUDIO API)
+   --------------------------------------------------------------------- */
+let ac = null, master = null, noiseBuf = null, muted = false;
+function audioInit() {
+  if (ac) { if (ac.state === 'suspended') ac.resume(); return; }
+  try {
+    ac = new (window.AudioContext || window.webkitAudioContext)();
+    master = ac.createGain(); master.gain.value = 0.5; master.connect(ac.destination);
+    noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  } catch (e) { ac = null; }
+}
+function toggleMute() { muted = !muted; if (master) master.gain.value = muted ? 0 : 0.5; }
+
+// Osilator dengan sapuan frekuensi & envelope sederhana (t = waktu absolut)
+function osc(type, f0, f1, t, dur, vol) {
+  if (!ac) return;
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.type = type; o.frequency.setValueAtTime(f0, t);
+  if (f1 !== f0) o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0008, t + dur);
+  o.connect(g); g.connect(master); o.start(t); o.stop(t + dur + 0.02);
+}
+function noiseAt(t, dur, vol, f0, f1, ftype) {
+  if (!ac) return;
+  const s = ac.createBufferSource(), f = ac.createBiquadFilter(), g = ac.createGain();
+  s.buffer = noiseBuf; s.loop = true; f.type = ftype || 'lowpass';
+  f.frequency.setValueAtTime(f0, t); f.frequency.exponentialRampToValueAtTime(Math.max(30, f1), t + dur);
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0008, t + dur);
+  s.connect(f); f.connect(g); g.connect(master); s.start(t, Math.random() * 0.5); s.stop(t + dur + 0.02);
+}
+const tone = (type, f0, f1, dur, vol, delay) => ac && osc(type, f0, f1, ac.currentTime + (delay || 0), dur, vol);
+const noise = (dur, vol, f0, f1, delay, ft) => ac && noiseAt(ac.currentTime + (delay || 0), dur, vol, f0, f1, ft);
+
+const sfx = {
+  shoot()   { tone('square', 980, 320, 0.09, 0.10); },
+  shootMid(){ tone('square', 760, 180, 0.18, 0.12); tone('triangle', 1500, 400, 0.12, 0.08); },
+  shootBig(){ tone('sawtooth', 620, 70, 0.34, 0.14); tone('square', 1240, 140, 0.3, 0.07); noise(0.25, 0.10, 3000, 300); },
+  thorn()   { tone('sawtooth', 500, 900, 0.07, 0.09); tone('square', 1300, 600, 0.09, 0.05, 0.03); },
+  charge(l) { tone('square', 300 + l * 9, 340 + l * 9, 0.06, 0.035); },
+  chargeUp(){ tone('triangle', 600, 1400, 0.15, 0.10); },
+  jump()    { tone('square', 260, 520, 0.09, 0.06); },
+  dash()    { noise(0.16, 0.12, 900, 4500); tone('sawtooth', 160, 420, 0.12, 0.06); },
+  land()    { noise(0.05, 0.06, 500, 200); },
+  hurt()    { tone('sawtooth', 440, 90, 0.24, 0.14); noise(0.15, 0.10, 2000, 400); },
+  hit()     { tone('square', 1300, 700, 0.045, 0.07); },
+  tink()    { tone('square', 2200, 1800, 0.03, 0.04); },
+  explode() { noise(0.36, 0.22, 1500, 90); tone('triangle', 150, 32, 0.3, 0.2); },
+  bigBoom() { noise(0.7, 0.3, 2400, 60); tone('triangle', 110, 25, 0.6, 0.3); },
+  pickup()  { tone('square', 660, 660, 0.06, 0.08); tone('square', 990, 990, 0.1, 0.08, 0.06); },
+  door()    { tone('sawtooth', 90, 55, 0.5, 0.14); noise(0.5, 0.08, 400, 150); },
+  thud()    { noise(0.25, 0.22, 500, 60); tone('triangle', 90, 30, 0.25, 0.25); },
+  roar()    { tone('sawtooth', 130, 60, 0.6, 0.16); tone('sawtooth', 137, 63, 0.6, 0.12); noise(0.5, 0.08, 800, 200); },
+  warn()    { tone('square', 880, 880, 0.05, 0.05); },
+  tick()    { tone('square', 1500, 1500, 0.02, 0.04); },
+  menu()    { tone('square', 520, 780, 0.08, 0.08); },
+  swap()    { tone('square', 700, 1050, 0.07, 0.07); },
+  check()   { [523, 659, 784, 1047].forEach((f, i) => tone('square', f, f, 0.1, 0.08, i * 0.07)); },
+  die()     { for (let i = 0; i < 6; i++) tone('square', 900 - i * 120, 300 - i * 30, 0.14, 0.1, i * 0.09); noise(0.6, 0.12, 2000, 100); },
+  fanfare() { [523, 523, 523, 659, 784, 659, 784, 1047].forEach((f, i) => { tone('square', f, f, i === 7 ? 0.6 : 0.13, 0.09, i * 0.14); tone('triangle', f / 2, f / 2, i === 7 ? 0.6 : 0.13, 0.1, i * 0.14); }); },
+  getWeapon(){ [392, 494, 587, 784, 988, 1175].forEach((f, i) => tone('square', f, f, 0.16, 0.08, i * 0.1)); }
+};
+
+// --- Musik: sequencer 3 kanal (lead square, bass triangle, drum noise) ---
+function midiOf(n) { const m = /^([A-G])(#?)(\d)$/.exec(n); return 12 * (+m[3] + 1) + { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 }[m[1]] + (m[2] ? 1 : 0); }
+const freqOf = m => 440 * Math.pow(2, (m - 69) / 12);
+function parseLead(str, tr) {
+  const tk = str.trim().split(/\s+/), out = [];
+  for (let i = 0; i < tk.length; i++) {
+    if (tk[i] === '.' || tk[i] === '-') { out.push(null); continue; }
+    let len = 1; while (tk[i + len] === '.') len++;
+    out.push({ m: midiOf(tk[i]) + (tr || 0), len });
+  }
+  return out;
+}
+const BOSS_A = 'A4 A4 C5 A4 E5 A4 D#5 A4  D5 A4 C5 A4 B4 C5 B4 G#4';
+const BOSS_B = 'A4 A4 C5 A4 E5 A4 F5 E5  D#5 E5 C5 A4 B4 G#4 E4 G#4';
+const SONGS = {
+  stage: {
+    bpm: 150,
+    lead: parseLead(
+      'E5 . G5 E5 B4 . D5 E5   . . G5 A5 B5 . A5 G5 ' +
+      'D5 . F#5 D5 A4 . B4 D5  . . F#5 G5 A5 . G5 F#5 ' +
+      'C5 . E5 G5 C6 . B5 G5   A5 . G5 E5 D5 . E5 G5 ' +
+      'B4 . D#5 F#5 B5 . A5 F#5  E5 . . . - . B4 D5'),
+    roots: [40, 40, 38, 38, 36, 45, 47, 40],
+    bass: [0, 0, 12, 0, 0, 0, 12, 0],
+    drums: 'KhShKKSh'
+  },
+  boss: {
+    bpm: 178,
+    lead: parseLead(BOSS_A).concat(parseLead(BOSS_B), parseLead(BOSS_A, 5), parseLead(BOSS_B)),
+    roots: [45, 45, 45, 40, 38, 38, 45, 40],
+    bass: [0, 12, 0, 12, 0, 12, 0, 12],
+    drums: 'KhSKKhSh'
+  }
+};
+let songName = null, song = null, mStep = 0, mNext = 0;
+function setMusic(name) { if (songName === name) return; songName = name; song = SONGS[name] || null; mStep = 0; mNext = 0; }
+function musicTick() {
+  if (!ac || !song || muted) return;
+  const now = ac.currentTime, sd = 60 / song.bpm / 2;      // satu langkah = not 1/8
+  if (mNext < now) mNext = now + 0.05;
+  while (mNext < now + 0.2) {
+    const s = mStep % 64, bar = (s / 8) | 0, k = s % 8, t = mNext;
+    const n = song.lead[s];
+    if (n) { osc('square', freqOf(n.m), freqOf(n.m), t, sd * n.len * 0.92, 0.05); }
+    const bf = freqOf(song.roots[bar] + song.bass[k]);
+    osc('triangle', bf, bf, t, sd * 0.85, 0.11);
+    const d = song.drums[k];
+    if (d === 'K') osc('sine', 150, 45, t, 0.11, 0.2);
+    else if (d === 'S') noiseAt(t, 0.1, 0.09, 6000, 1500, 'highpass');
+    else noiseAt(t, 0.03, 0.03, 9000, 7000, 'highpass');
+    mNext += sd; mStep++;
+  }
+}
+
+/* ---------------------------------------------------------------------
+   4. FONT PIXEL 3x5 (digambar per piksel agar tetap tajam)
+   --------------------------------------------------------------------- */
+const FONT = {
+  A: '010101111101101', B: '110101110101110', C: '011100100100011', D: '110101101101110',
+  E: '111100110100111', F: '111100110100100', G: '011100101101011', H: '101101111101101',
+  I: '111010010010111', J: '001001001101010', K: '101101110101101', L: '100100100100111',
+  M: '101111111101101', N: '110101101101101', O: '111101101101111', P: '110101110100100',
+  Q: '010101101110011', R: '110101110101101', S: '011100010001110', T: '111010010010010',
+  U: '101101101101111', V: '101101101101010', W: '101101111111101', X: '101101010101101',
+  Y: '101101010010010', Z: '111001010100111',
+  0: '010101101101010', 1: '010110010010111', 2: '110001010100111', 3: '110001010001110',
+  4: '101101111001001', 5: '111100110001110', 6: '011100111101111', 7: '111001010010010',
+  8: '111101111101111', 9: '111101111001110',
+  '.': '000000000000010', ',': '000000000010100', '!': '010010010000010', '?': '110001010000010',
+  '-': '000000111000000', ':': '000010000010000', '/': '001001010100100', "'": '010010000000000',
+  '+': '000010111010000', '%': '101001010100101', '>': '100010001010100', '<': '001010100010001',
+  '(': '010100100100010', ')': '010001001001010', '=': '000111000111000'
+};
+function text(s, x, y, c, sc, align) {
+  s = String(s).toUpperCase(); sc = sc || 1;
+  const w = s.length * 4 * sc - sc;
+  if (align === 1) x -= w >> 1; else if (align === 2) x -= w;
+  ctx.fillStyle = c;
+  for (let i = 0; i < s.length; i++) {
+    const g = FONT[s[i]]; if (!g) continue;
+    for (let j = 0; j < 15; j++) if (g[j] === '1')
+      ctx.fillRect(x + i * 4 * sc + (j % 3) * sc, y + ((j / 3) | 0) * sc, sc, sc);
+  }
+}
+function textS(s, x, y, c, sc, align) { sc = sc || 1; text(s, x + sc, y + sc, '#04121a', sc, align); text(s, x, y, c, sc, align); }
+const rect = (x, y, w, h, c) => { ctx.fillStyle = c; ctx.fillRect(x, y, w, h); };
+
+/* ---------------------------------------------------------------------
+   5. LEVEL: PETA TILE, DEFINISI ENTITAS, PRA-RENDER
+   Tile: 0 udara, 1 tanah, 2 logam, 3 duri, 4 pintu (solid tak terlihat)
+   --------------------------------------------------------------------- */
+const map = new Uint8Array(LW * LH);
+function fill(x, y, w, h, t) { for (let j = y; j < y + h; j++) for (let i = x; i < x + w; i++) map[j * LW + i] = t; }
+function buildLevel() {
+  map.fill(0);
+  // A. Tepi hutan
+  fill(0, 15, 26, 3, 1); fill(14, 14, 4, 1, 1); fill(18, 13, 3, 2, 1);
+  fill(29, 15, 16, 3, 1); fill(40, 14, 1, 1, 2);
+  // B. Kebun duri + platform
+  fill(45, 16, 14, 2, 1); fill(45, 15, 14, 1, 3);
+  fill(47, 13, 3, 1, 2); fill(52, 11, 3, 1, 2); fill(56, 13, 2, 1, 2);
+  fill(59, 15, 37, 3, 1);
+  // C. Cerobong wall jump
+  fill(74, 0, 2, 12, 2); fill(79, 5, 3, 10, 2); fill(79, 5, 7, 1, 2);
+  fill(88, 8, 3, 1, 2); fill(92, 11, 3, 1, 2);
+  // D. Checkpoint + jurang platform bergerak
+  fill(96, 15, 8, 3, 1);
+  fill(120, 15, 6, 3, 1);
+  // E. Bagian dalam pabrik
+  fill(126, 15, 75, 3, 2); fill(126, 0, 75, 6, 2); fill(126, 6, 2, 4, 2);
+  fill(132, 13, 2, 2, 2);
+  fill(140, 15, 10, 1, 3); fill(142, 13, 2, 1, 2); fill(146, 12, 2, 1, 2);
+  fill(154, 9, 3, 6, 2);
+  fill(170, 6, 7, 3, 2);
+  // F. Arena boss
+  fill(DOOR_COL, 6, 1, 6, 2); fill(200, 0, 1, 18, 2);
+}
+function tileAt(tx, ty) { if (tx < 0 || tx >= LW || ty >= LH) return 0; if (ty < 0) ty = 0; return map[ty * LW + tx]; }
+function isSolid(tx, ty) {
+  if (tx < 0 || tx >= LW) return true;
+  if (ty >= LH) return false;
+  if (ty < 0) ty = 0;
+  const t = map[ty * LW + tx]; return t === 1 || t === 2 || t === 4;
+}
+
+// [tipe, kolom, baris]
+const ENEMY_DEFS = [
+  ['hopper', 23, 14], ['drone', 33, 10], ['turret', 40, 13],
+  ['drone', 50, 8], ['drone', 56, 9], ['turret', 64, 14], ['hopper', 69, 14],
+  ['drone', 86, 3], ['hopper', 93, 14],
+  ['drone', 108, 9], ['drone', 115, 7],
+  ['hopper', 129, 14], ['turret', 133, 12], ['hopper', 137, 14], ['drone', 145, 8],
+  ['drone', 152, 8], ['turret', 161, 14], ['hopper', 165, 14]
+];
+const PICKUP_DEFS = [['small', 84, 4], ['big', 83, 14], ['small', 122, 14], ['big', 173, 14]];
+const CP_DEFS = [98, 171];
+const PLAT_DEFS = [
+  { kind: 'h', a: 1672, b: 1756, y: 234, period: 220 },
+  { kind: 'v', x: 1808, a: 168, b: 234, period: 200 },
+  { kind: 'h', a: 1852, b: 1884, y: 200, period: 160 }
+];
+
+// RNG ber-seed agar dekorasi selalu sama
+function mulberry(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+function makeCanvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+
+// Pra-render seluruh level ke satu kanvas (cepat saat digambar)
+let levelCv = null;
+function renderLevelCanvas() {
+  levelCv = makeCanvas(LW * TS, LH * TS);
+  const g = levelCv.getContext('2d'), R = mulberry(7);
+  const r = (x, y, w, h, c) => { g.fillStyle = c; g.fillRect(x, y, w, h); };
+  // Dinding belakang pabrik
+  const fx = 126 * TS, bx = DOOR_COL * TS;
+  r(fx, 0, bx - fx, LH * TS, '#0b1a24');
+  for (let x = fx; x < bx; x += 32) r(x, 0, 1, LH * TS, '#122c38');
+  for (let y = 16; y < LH * TS; y += 48) r(fx, y, bx - fx, 1, '#122c38');
+  r(fx, 150, bx - fx, 4, '#15404a'); r(fx, 154, bx - fx, 1, '#0a2028');
+  for (let x = fx + 40; x < bx; x += 96) {           // jendela ke arah hutan
+    r(x, 112, 22, 26, '#061016'); r(x + 2, 114, 18, 22, '#0f4a4a'); r(x + 2, 126, 18, 10, '#136052');
+    r(x + 10, 114, 2, 22, '#061016'); r(x + 4, 118, 3, 8, '#1b7a66');
+  }
+  for (let i = 0; i < 60; i++) { const x = fx + R() * (bx - fx), y = 100 + R() * 130; r(x | 0, y | 0, 1, 1, R() < .5 ? '#2de0b0' : '#e8b83c'); }
+  // Dinding belakang arena boss
+  r(bx, 0, LW * TS - bx, LH * TS, '#150b22');
+  for (let x = bx; x < LW * TS; x += 32) r(x, 0, 1, LH * TS, '#27143c');
+  for (let y = 16; y < LH * TS; y += 32) r(bx, y, LW * TS - bx, 1, '#27143c');
+  for (let i = 0; i < 9; i++) {                       // sulur berduri menyala
+    const vx = bx + 30 + i * 40, vl = 30 + ((R() * 60) | 0);
+    r(vx, CEIL, 2, vl, '#3d1c5c');
+    for (let y = CEIL + 6; y < CEIL + vl; y += 9) { r(vx - 2, y, 2, 1, '#ff9a2e'); r(vx + 2, y + 4, 2, 1, '#ff9a2e'); }
+  }
+  // Tile
+  for (let ty = 0; ty < LH; ty++) for (let tx = 0; tx < LW; tx++) {
+    const t = map[ty * LW + tx], x = tx * TS, y = ty * TS;
+    const openTop = ty > 0 && !isSolid(tx, ty - 1) && map[(ty - 1) * LW + tx] !== 3;
+    if (t === 1) {
+      r(x, y, 16, 16, '#3b2a1e');
+      for (let i = 0; i < 5; i++) r(x + ((R() * 14) | 0), y + ((R() * 14) | 0), 2, 1, '#2a1c13');
+      if (R() < .4) r(x + ((R() * 12) | 0), y + 4 + ((R() * 8) | 0), 3, 2, '#4d382a');
+      if (openTop) {
+        r(x, y, 16, 4, '#2f9e4c'); r(x, y, 16, 2, '#4fd067'); r(x, y, 16, 1, '#9af07f');
+        for (let i = 0; i < 16; i += 3) r(x + i, y + 4, 2, 1 + ((R() * 3) | 0), '#2f9e4c');
+      }
+    } else if (t === 2) {
+      r(x, y, 16, 16, '#3a4a58'); r(x, y, 16, 1, '#5b7284'); r(x, y, 1, 16, '#4a5f70');
+      r(x, y + 15, 16, 1, '#222e38'); r(x + 15, y, 1, 16, '#2a3844');
+      r(x + 2, y + 2, 1, 1, '#8fa6b8'); r(x + 13, y + 2, 1, 1, '#8fa6b8'); r(x + 2, y + 13, 1, 1, '#8fa6b8'); r(x + 13, y + 13, 1, 1, '#8fa6b8');
+      if ((tx + ty) % 4 === 0) r(x + 5, y + 7, 6, 2, '#2a3844');
+      if (openTop) { r(x, y, 16, 2, '#7d96a8'); if (tx < DOOR_COL) for (let i = 0; i < 3; i++) r(x + ((R() * 13) | 0), y, 3, 1 + ((R() * 2) | 0), '#3fb85a'); }
+    } else if (t === 3) {
+      r(x, y + 13, 16, 3, '#3a4a58');
+      for (let i = 0; i < 4; i++) { const b = x + i * 4; r(b, y + 9, 4, 4, '#7d8b96'); r(b + 1, y + 5, 2, 4, '#aab8c2'); r(b + 1, y + 2, 2, 3, '#eef6fa'); r(b + 2, y + 2, 1, 11, '#5a6772'); }
+    }
+  }
+  // Rangka pintu boss
+  r(bx, 11 * TS + 12, 16, 4, '#e8b83c'); for (let i = 0; i < 16; i += 4) r(bx + i, 11 * TS + 12, 2, 4, '#1a1a1a');
+}
+
+// Lapisan latar paralaks
+let skyCv, farCv, midCv;
+function renderBackgrounds() {
+  skyCv = makeCanvas(W, H);
+  let g = skyCv.getContext('2d');
+  const bands = ['#06141f', '#071b28', '#082432', '#0a2f3c', '#0c3b45', '#0f4a4e', '#135a55', '#186b5c', '#1e7c62'];
+  bands.forEach((c, i) => { g.fillStyle = c; g.fillRect(0, i * 24, W, 24); });
+  g.fillStyle = '#d7f7e8';                            // bulan sabit
+  for (let y = -11; y <= 11; y++) for (let x = -11; x <= 11; x++)
+    if (x * x + y * y <= 121 && (x - 6) * (x - 6) + (y + 4) * (y + 4) > 110) g.fillRect(310 + x, 38 + y, 1, 1);
+  const R = mulberry(3);
+  for (let i = 0; i < 40; i++) { g.fillStyle = R() < .5 ? '#9fd8d0' : '#5fa8a8'; g.fillRect((R() * W) | 0, (R() * 90) | 0, 1, 1); }
+
+  farCv = makeCanvas(512, H); g = farCv.getContext('2d');
+  const r = (x, y, w, h, c) => { g.fillStyle = c; g.fillRect(x, y, w, h); };
+  for (let i = 0; i < 9; i++) {
+    const x = (i * 57 + R() * 20) | 0;
+    if (i % 3 === 1) {                                // menara pabrik
+      const h = 90 + ((R() * 50) | 0); r(x, H - h, 26, h, '#0d323a'); r(x + 4, H - h - 14, 6, 14, '#0d323a'); r(x + 15, H - h - 22, 7, 22, '#0d323a');
+      for (let wy = H - h + 8; wy < H - 10; wy += 14) for (let wx = x + 4; wx < x + 22; wx += 7) if (R() < .55) r(wx, wy, 3, 4, '#d9a93a');
+      r(x + 17, H - h - 24, 2, 2, '#ff5050');
+    } else {                                           // pohon raksasa
+      const h = 100 + ((R() * 70) | 0); r(x + 8, H - h, 8, h, '#0e3a40');
+      for (let k = 0; k < 4; k++) r(x - 6 + k * 3, H - h - 4 + k * 12, 36 - k * 6 + ((R() * 8) | 0), 12, '#104248');
+    }
+  }
+  r(0, H - 26, 512, 26, '#0e3a40');
+
+  midCv = makeCanvas(512, H); g = midCv.getContext('2d');
+  for (let i = 0; i < 6; i++) {
+    const x = (i * 85 + R() * 30) | 0, w = 18 + ((R() * 14) | 0);
+    r(x, 0, w, H, '#0a2a30'); r(x, 0, 2, H, '#0e383e');
+    for (let y = 20 + ((R() * 30) | 0); y < H; y += 46) { r(x - 2, y, w + 4, 5, '#124a4c'); r(x - 2, y, w + 4, 1, '#1a6260'); } // cincin pipa
+    const vl = 20 + ((R() * 50) | 0); r(x + w + 6, 0, 1, vl, '#17604a'); r(x + w + 5, vl, 3, 3, '#2fae6a');                 // sulur
+    r(x - 18, 0, 50 + w, 14 + ((R() * 10) | 0), '#0c3034');                                                               // kanopi
+  }
+  r(0, H - 12, 512, 12, '#0a2a30');
+}
+
+/* ---------------------------------------------------------------------
+   6. TABRAKAN TILE (gerak sumbu X lalu Y secara terpisah)
+   --------------------------------------------------------------------- */
+function moveX(e, dx) {
+  e.x += dx; e.hitWall = 0;
+  const y0 = Math.floor(e.y / TS), y1 = Math.floor((e.y + e.h - 0.01) / TS);
+  if (dx > 0) {
+    const tx = Math.floor((e.x + e.w - 0.01) / TS);
+    for (let ty = y0; ty <= y1; ty++) if (isSolid(tx, ty)) { e.x = tx * TS - e.w; e.hitWall = 1; break; }
+  } else if (dx < 0) {
+    const tx = Math.floor(e.x / TS);
+    for (let ty = y0; ty <= y1; ty++) if (isSolid(tx, ty)) { e.x = (tx + 1) * TS; e.hitWall = -1; break; }
+  }
+}
+function moveY(e, dy) {
+  e.y += dy; e.onGround = false; e.hitCeil = false;
+  const x0 = Math.floor(e.x / TS), x1 = Math.floor((e.x + e.w - 0.01) / TS);
+  if (dy > 0) {
+    const ty = Math.floor((e.y + e.h - 0.01) / TS);
+    for (let tx = x0; tx <= x1; tx++) if (isSolid(tx, ty)) { e.y = ty * TS - e.h; e.onGround = true; break; }
+  } else if (dy < 0) {
+    const ty = Math.floor(e.y / TS);
+    for (let tx = x0; tx <= x1; tx++) if (isSolid(tx, ty)) { e.y = (ty + 1) * TS; e.hitCeil = true; break; }
+  }
+}
+function touchWall(e, dir) {
+  const px = dir < 0 ? e.x - 1 : e.x + e.w, tx = Math.floor(px / TS);
+  return isSolid(tx, Math.floor((e.y + 3) / TS)) || isSolid(tx, Math.floor((e.y + e.h - 4) / TS));
+}
+
+/* ---------------------------------------------------------------------
+   7. STATE GAME & ENTITAS
+   --------------------------------------------------------------------- */
+let state = 'title', stateT = 0, frame = 0;
+let P = null, enemies = [], bullets = [], particles = [], pickups = [], plats = [], cps = [], thorns = [];
+let boss = null, bossLock = false, door = { h: 0, closed: false };
+let cpIndex = -1, thornUnlocked = false, deaths = 0, playTime = 0, shake = 0, flashT = 0;
+let msg = { s: '', t: 0 };
+const cam = { x: 0, y: 0, look: 0 };
+
+function newPlayer(x, y) {
+  const p = {
+    x, y, w: 12, h: 22, vx: 0, vy: 0, face: 1, onGround: false, hitWall: 0, hitCeil: false,
+    coyote: 0, jumpBuf: 0, dashT: 0, dashDir: 1, airDashing: false, airDashUsed: false, dashJump: false,
+    wallJumpT: 0, wjDir: 0, sliding: false, ride: null,
+    hp: 16, maxHp: 16, inv: 0, hurtT: 0, knock: 0,
+    charge: 0, shootT: 0, weapon: 0, energy: 24, maxEnergy: 24,
+    anim: 0, pose: 'stand', scarf: [], ghosts: []
+  };
+  for (let i = 0; i < 7; i++) p.scarf.push({ x: x + 6 - i * 3, y: y + 6 });
+  return p;
+}
+function makeEnemy(d) {
+  const [type, c, r] = d;
+  const e = { type, w: 14, h: type === 'drone' ? 12 : 14, vx: 0, vy: 0, t: (c * 37) % 90, face: -1, flash: 0, dead: false, onGround: false, cd: 60 };
+  e.x = c * TS + 1; e.y = r * TS + TS - e.h; e.baseY = e.y;
+  e.hp = type === 'drone' ? 2 : type === 'turret' ? 4 : 3;
+  e.dmg = type === 'hopper' ? 3 : 2;
+  return e;
+}
+function makePickup(kind, x, y, life) {
+  const s = kind === 'big' ? 12 : 8;
+  return { kind, x, y, w: s, h: s, vy: 0, life: life || -1, onGround: false, dead: false };
+}
+
+function startGame() {
+  cpIndex = -1; deaths = 0; playTime = 0;
+  cps = CP_DEFS.map(c => ({ x: c * TS + 2, y: FLOOR - 28, w: 12, h: 28, on: false }));
+  resetLevel();
+  state = 'play'; stateT = 0; msg = { s: 'READY', t: 70 };
+}
+function resetLevel() {
+  buildLevel();
+  enemies = ENEMY_DEFS.map(makeEnemy);
+  pickups = PICKUP_DEFS.map(d => makePickup(d[0], d[1] * TS + (d[0] === 'big' ? 2 : 4), d[2] * TS + (d[0] === 'big' ? 4 : 8)));
+  plats = PLAT_DEFS.map(d => ({ d, x: d.kind === 'h' ? d.a : d.x, y: d.kind === 'h' ? d.y : d.b, w: 32, h: 6, dx: 0, dy: 0, t: 0 }));
+  bullets = []; particles = []; thorns = [];
+  boss = null; bossLock = false; door = { h: 0, closed: false }; shake = 0;
+  const sx = cpIndex >= 0 ? cps[cpIndex].x : 3 * TS;
+  const weapon = P ? P.weapon : 0;
+  P = newPlayer(sx, FLOOR - 22); P.weapon = thornUnlocked ? weapon : 0;
+  cam.look = 0; cam.x = clamp(P.x - W / 2, 0, ROOM_L - W); cam.y = LH * TS - H;
+  setMusic('stage');
+}
+
+/* ---------------------------------------------------------------------
+   8. PARTIKEL & EFEK
+   --------------------------------------------------------------------- */
+function part(x, y, vx, vy, life, color, size, grav) { particles.push({ x, y, vx, vy, life, max: life, color, size: size || 2, grav: grav || 0 }); }
+function explosion(x, y, big) {
+  const n = big ? 22 : 12, cols = ['#ffffff', '#ffe14d', '#ff9a2e', '#ff5a3c'];
+  for (let i = 0; i < n; i++) { const a = Math.random() * 6.283, s = rnd(0.4, big ? 3.2 : 2.2); part(x, y, Math.cos(a) * s, Math.sin(a) * s, rnd(14, 30), cols[(Math.random() * 4) | 0], big ? 4 : 3, 0.03); }
+  for (let i = 0; i < 4; i++) part(x + rnd(-6, 6), y + rnd(-6, 6), 0, -0.3, 10 + i * 3, '#ffffff', big ? 8 : 6);
+}
+function spark(x, y, c) { for (let i = 0; i < 4; i++) part(x, y, rnd(-1.5, 1.5), rnd(-1.5, 1.5), 8, c || '#fff7a8', 1); }
+function dust(x, y, dir) { for (let i = 0; i < 3; i++) part(x, y, dir * rnd(0.2, 1), rnd(-0.6, 0), 12, '#b9c8c0', 2); }
+function updateParticles() {
+  for (const p of particles) { p.x += p.vx; p.y += p.vy; p.vy += p.grav; p.life--; }
+  particles = particles.filter(p => p.life > 0);
+}
+
+/* ---------------------------------------------------------------------
+   9. PEMAIN: RANA
+   --------------------------------------------------------------------- */
+function playerShotOrigin(p, w, h) {
+  const y = p.y + (p.dashT > 0 ? 14 : 9) - h / 2;
+  return { x: p.face > 0 ? p.x + p.w + 1 : p.x - 1 - w, y };
+}
+function fireWeapon(level) {
+  const p = P;
+  if (p.weapon === 1) {                               // Thorn Shot: 3 duri menyebar, menembus musuh
+    if (p.energy < 2 || bullets.filter(b => b.kind === 'thorn').length > 6) { sfx.tink(); return; }
+    p.energy -= 2; p.shootT = 14; sfx.thorn();
+    const o = playerShotOrigin(p, 8, 4);
+    for (const a of [-0.28, 0, 0.28])
+      bullets.push({ kind: 'thorn', friendly: true, x: o.x, y: o.y, w: 8, h: 4, vx: Math.cos(a) * 5 * p.face, vy: Math.sin(a) * 5, dmg: 2, pierce: true, hit: new Set(), t: 0 });
+    return;
+  }
+  const defs = [{ kind: 'p0', w: 6, h: 4, v: 5.5, dmg: 1 }, { kind: 'p1', w: 10, h: 8, v: 6, dmg: 2 }, { kind: 'p2', w: 18, h: 14, v: 6, dmg: 4 }];
+  const d = defs[level];
+  if (level === 0 && bullets.filter(b => b.kind === 'p0').length >= 3) return;
+  const o = playerShotOrigin(p, d.w, d.h);
+  bullets.push({ kind: d.kind, friendly: true, x: o.x, y: o.y, w: d.w, h: d.h, vx: d.v * p.face, vy: 0, dmg: d.dmg, pierce: level === 2, hit: new Set(), t: 0 });
+  p.shootT = 14;
+  [sfx.shoot, sfx.shootMid, sfx.shootBig][level]();
+  if (level) spark(o.x + d.w / 2, o.y + d.h / 2, '#8ff5dc');
+}
+
+function hurtPlayer(dmg, srcX) {
+  const p = P;
+  if (p.inv > 0 || state !== 'play' || (boss && boss.state === 'dying')) return;
+  p.hp -= dmg; sfx.hurt(); shake = Math.max(shake, 3);
+  if (p.hp <= 0) { p.hp = 0; killPlayer(); return; }
+  p.inv = 80; p.hurtT = 18; p.knock = (p.x + 6 < srcX) ? -1 : 1; p.vy = -2.2;
+  p.dashT = 0; p.airDashing = false; p.dashJump = false; p.wallJumpT = 0; p.onGround = false; p.ride = null;
+}
+function killPlayer() {
+  state = 'dying'; stateT = 0; deaths++; setMusic(null); sfx.die();
+  const cx = P.x + 6, cy = P.y + 11;
+  for (let i = 0; i < 16; i++) { const a = i / 8 * Math.PI, s = i < 8 ? 1.2 : 2.4; part(cx, cy, Math.cos(a) * s, Math.sin(a) * s, 70, i % 2 ? '#8ff5dc' : '#ffffff', 4); }
+}
+
+function updatePlayer() {
+  const p = P;
+  if (p.inv > 0) p.inv--;
+  if (p.shootT > 0) p.shootT--;
+  const dir = (held.right ? 1 : 0) - (held.left ? 1 : 0);
+  const wasGround = p.onGround;
+
+  // Terbawa platform bergerak
+  if (p.ride) { if (p.ride.dx) moveX(p, p.ride.dx); p.y = p.ride.y - p.h; }
+
+  if (p.hurtT > 0) {                                  // terpental, kontrol terkunci sebentar
+    p.hurtT--; p.vx = p.knock * 0.9;
+  } else {
+    // Ganti senjata
+    if ((pressed.wprev || pressed.wnext) && thornUnlocked) {
+      p.weapon = 1 - p.weapon; p.charge = 0; sfx.swap();
+      msg = { s: p.weapon ? 'THORN SHOT' : 'PULSE BLASTER', t: 70 };
+    }
+    // Mulai dash (darat atau udara sekali per lompatan)
+    if (pressed.dash && p.dashT <= 0 && (p.onGround || !p.airDashUsed)) {
+      p.dashDir = dir || (p.sliding ? p.face : p.face); p.face = p.dashDir; p.wallJumpT = 0;
+      if (p.onGround) { p.dashT = 28; p.airDashing = false; dust(p.x + 6, p.y + p.h, -p.dashDir); }
+      else { p.dashT = 22; p.airDashing = true; p.airDashUsed = true; p.vy = 0; }
+      sfx.dash();
+    }
+    // Gerak horizontal: akselerasi instan agar terasa "tight"
+    if (p.dashT > 0) {
+      p.dashT--; p.vx = p.dashDir * DASH;
+      if (!held.dash || (dir && dir !== p.dashDir)) p.dashT = 0;
+    } else if (p.wallJumpT > 0) {
+      p.wallJumpT--; p.vx = p.wjDir * (p.dashJump ? DASH : RUN);
+    } else {
+      p.vx = dir * ((p.dashJump && !p.onGround) ? DASH : RUN);
+      if (dir) p.face = dir;
+    }
+    if (p.dashT <= 0) p.airDashing = false;
+
+    // Lompat: buffer input + coyote time + wall jump
+    if (pressed.jump) p.jumpBuf = 6; else if (p.jumpBuf > 0) p.jumpBuf--;
+    if (p.jumpBuf > 0) {
+      const wd = touchWall(p, 1) ? 1 : touchWall(p, -1) ? -1 : 0;
+      if (p.onGround || p.coyote > 0) {
+        p.vy = -JUMP; p.dashJump = p.dashJump || p.dashT > 0; p.dashT = 0; p.airDashing = false;
+        p.onGround = false; p.coyote = 0; p.jumpBuf = 0; p.ride = null; sfx.jump();
+      } else if (wd) {
+        p.vy = -JUMP; p.wjDir = -wd; p.wallJumpT = 8; p.dashJump = held.dash; p.face = -wd;
+        p.dashT = 0; p.airDashing = false; p.airDashUsed = false; p.jumpBuf = 0; sfx.jump();
+        spark(wd > 0 ? p.x + p.w : p.x, p.y + p.h - 2, '#ffffff');
+      }
+    }
+    // Tinggi lompatan tergantung lama tombol ditekan
+    if (!held.jump && p.vy < -1.2) p.vy = -1.2;
+  }
+
+  // Gravitasi & wall slide
+  if (!p.airDashing) { p.vy += GRAV; if (p.vy > MAXFALL) p.vy = MAXFALL; }
+  p.sliding = false;
+  if (!p.onGround && !p.ride && p.vy > 0 && p.hurtT <= 0 && p.dashT <= 0 && dir && touchWall(p, dir)) {
+    p.sliding = true; if (p.vy > 1) p.vy = 1; p.face = -dir; p.dashJump = false;
+    if (frame % 6 === 0) part(dir > 0 ? p.x + p.w : p.x, p.y + p.h, 0, -0.2, 10, '#b9c8c0', 2);
+  }
+
+  // Gerak + tabrakan
+  const prevBottom = p.y + p.h;
+  moveX(p, p.vx);
+  if (p.hitWall && p.dashT > 0) { p.dashT = 0; p.airDashing = false; }
+  moveY(p, p.vy);
+  if (p.hitCeil) p.vy = 0;
+  p.ride = null;
+  if (p.onGround) p.vy = 0;
+  else if (p.vy >= 0) {
+    for (const pl of plats) {
+      if (p.x + p.w > pl.x && p.x < pl.x + pl.w && prevBottom <= pl.y - pl.dy + 2 && p.y + p.h >= pl.y) {
+        p.y = pl.y - p.h; p.vy = 0; p.onGround = true; p.ride = pl; break;
+      }
+    }
+  }
+  if (p.onGround) {
+    if (!wasGround) { dust(p.x + 6, p.y + p.h, 1); dust(p.x + 6, p.y + p.h, -1); sfx.land(); }
+    p.coyote = 6; p.airDashUsed = false; if (p.dashT <= 0) p.dashJump = false;
+  } else {
+    if (p.coyote > 0) p.coyote--;
+    if (p.dashT > 0 && !p.airDashing) { p.dashJump = true; p.dashT = 0; }   // dash keluar tepian = momentum terjaga
+  }
+
+  // Tembak & charge
+  if (p.hurtT <= 0) {
+    if (pressed.shoot) fireWeapon(0);
+    if (held.shoot && p.weapon === 0) {
+      p.charge++;
+      if (p.charge === CH1 || p.charge === CH2) sfx.chargeUp();
+      if (p.charge > 12 && p.charge % 6 === 0) sfx.charge(Math.min(p.charge, CH2 + 10) / 4);
+      if (p.charge >= CH1 && frame % 2 === 0) {       // kilau partikel tersedot ke tubuh
+        const a = Math.random() * 6.283, big = p.charge >= CH2, r = 18;
+        part(p.x + 6 + Math.cos(a) * r, p.y + 11 + Math.sin(a) * r, -Math.cos(a) * 1.5 + p.vx, -Math.sin(a) * 1.5, 11,
+          big ? (Math.random() < .5 ? '#ffe14d' : '#ff8ad0') : (Math.random() < .5 ? '#8ff5dc' : '#ffffff'), big ? 2 : 1);
+      }
+    } else {
+      if (p.charge >= CH1) fireWeapon(p.charge >= CH2 ? 2 : 1);
+      p.charge = 0;
+    }
+  }
+  if (p.weapon === 1 || p.energy < p.maxEnergy) { if (frame % 40 === 0 && p.energy < p.maxEnergy) p.energy++; }
+
+  // Pose animasi
+  p.pose = p.hurtT > 0 ? 'hurt' : p.sliding ? 'slide' : p.dashT > 0 ? 'dash' : !p.onGround ? (p.vy < 0 ? 'jump' : 'fall') : p.vx ? 'run' : 'stand';
+  if (p.pose === 'run') p.anim++; else p.anim = 0;
+  // Bayangan dash
+  if ((p.dashT > 0 || (p.dashJump && !p.onGround)) && frame % 3 === 0) p.ghosts.push({ x: p.x, y: p.y, face: p.face, pose: p.pose, life: 10 });
+  for (const g of p.ghosts) g.life--;
+  p.ghosts = p.ghosts.filter(g => g.life > 0);
+  updateScarf(p);
+
+  // Bahaya: jurang & duri
+  if (p.y > LH * TS + 10) { p.hp = 0; killPlayer(); return; }
+  const fy = Math.floor((p.y + p.h - 3) / TS);
+  if (tileAt(Math.floor((p.x + 2) / TS), fy) === 3 || tileAt(Math.floor((p.x + p.w - 2) / TS), fy) === 3) hurtPlayer(4, p.x + 6 + p.face);
+}
+
+// Syal energi: rantai titik yang mengejar leher dengan gelombang
+function updateScarf(p) {
+  const s = p.scarf;
+  s[0].x = p.x + 6 - p.face * 4; s[0].y = p.y + 6 + (p.pose === 'dash' ? 5 : 0);
+  for (let i = 1; i < s.length; i++) {
+    const tx = s[i - 1].x - p.face * 2.6 - p.vx * 0.35;
+    const ty = s[i - 1].y + Math.sin(frame * 0.35 + i * 1.1) * 1.4 - p.vy * 0.3 + 0.3;
+    s[i].x += (tx - s[i].x) * 0.5; s[i].y += (ty - s[i].y) * 0.5;
+  }
+}
+
+/* ---------------------------------------------------------------------
+   10. MUSUH, PELURU, ITEM, PLATFORM
+   --------------------------------------------------------------------- */
+function killEnemy(e) {
+  e.dead = true; explosion(e.x + e.w / 2, e.y + e.h / 2); sfx.explode();
+  const r = Math.random();
+  if (r < 0.12) pickups.push(makePickup('big', e.x + 1, e.y, 480));
+  else if (r < 0.42) pickups.push(makePickup('small', e.x + 3, e.y + 2, 480));
+}
+function updateEnemies() {
+  for (const e of enemies) {
+    if (e.dead) continue;
+    if (!(e.x + e.w > cam.x - 40 && e.x < cam.x + W + 40 && e.y + e.h > cam.y - 80 && e.y < cam.y + H + 80)) continue;
+    e.t++; if (e.flash > 0) e.flash--;
+    const dx = P.x + 6 - (e.x + e.w / 2), dy = P.y + 11 - (e.y + e.h / 2);
+    if (e.type === 'drone') {                         // Drone terbang: mengejar dengan ayunan
+      e.face = dx < 0 ? -1 : 1;
+      if (Math.abs(dx) < 170) {
+        e.vx = clamp(e.vx + Math.sign(dx) * 0.03, -0.9, 0.9);
+        const ty = P.y + 2 + Math.sin(e.t * 0.05) * 16;
+        e.vy = clamp(e.vy + Math.sign(ty - e.y) * 0.025, -0.6, 0.6);
+      } else { e.vx *= 0.95; e.vy = Math.sin(e.t * 0.05) * 0.3; }
+      e.x += e.vx; e.y += e.vy;
+    } else if (e.type === 'turret') {                 // Robot penembak diam
+      e.face = dx < 0 ? -1 : 1; e.cd--;
+      if (e.cd <= 0 && Math.abs(dx) < 190 && Math.abs(dy) < 90) {
+        e.cd = 110; sfx.tick();
+        const vy = clamp(dy / Math.max(40, Math.abs(dx)) * 2.2, -0.8, 0.8);
+        bullets.push({ kind: 'e', friendly: false, x: e.face > 0 ? e.x + e.w : e.x - 5, y: e.y + 3, w: 5, h: 5, vx: e.face * 2.2, vy, dmg: 2, t: 0 });
+      }
+    } else {                                          // Robot pelompat
+      e.vy = Math.min(e.vy + GRAV, MAXFALL);
+      if (e.onGround) {
+        e.vx = 0; e.cd--; if (dx) e.face = dx < 0 ? -1 : 1;
+        if (e.cd <= 0 && Math.abs(dx) < 170) { e.vy = -4.4; e.vx = e.face * 1.5; e.cd = 45 + ((Math.random() * 30) | 0); }
+      }
+      moveX(e, e.vx); moveY(e, e.vy);
+      if (e.onGround) e.vy = 0; if (e.hitCeil) e.vy = 0;
+      if (e.y > LH * TS + 40) e.dead = true;
+    }
+    if (overlap(e, P)) hurtPlayer(e.dmg, e.x + e.w / 2);
+  }
+}
+
+function damageBoss(b, dmg) {
+  const s = boss.state;
+  if (s === 'wait' || s === 'intro' || s === 'dying') return;
+  if (boss.inv > 0) { sfx.tink(); return; }
+  boss.hp -= dmg; boss.inv = 14; sfx.hit();
+  if (boss.hp <= 0) {
+    boss.hp = 0; boss.state = 'dying'; boss.t = 0; thorns = []; setMusic(null);
+    bullets = bullets.filter(x => x.friendly);
+  } else if (!boss.raged && boss.hp <= boss.maxHp / 2) { boss.raged = true; sfx.roar(); shake = 8; flashT = 6; }
+}
+function updateBullets() {
+  for (const b of bullets) {
+    b.x += b.vx; b.y += b.vy; b.t++;
+    if (b.x > cam.x + W + 24 || b.x + b.w < cam.x - 24 || b.y > cam.y + H + 24 || b.y + b.h < cam.y - 40) { b.dead = true; continue; }
+    if (isSolid(Math.floor((b.x + b.w / 2) / TS), Math.floor((b.y + b.h / 2) / TS))) { b.dead = true; spark(b.x + b.w / 2, b.y + b.h / 2, b.friendly ? '#fff7a8' : '#ff8a5a'); continue; }
+    if (b.friendly) {
+      for (const e of enemies) {
+        if (e.dead || b.hit.has(e) || !overlap(b, e)) continue;
+        e.hp -= b.dmg; e.flash = 5; sfx.hit(); b.hit.add(e);
+        if (e.hp <= 0) killEnemy(e);
+        if (!b.pierce || (b.kind === 'p2' && !e.dead)) { b.dead = true; break; }
+      }
+      if (!b.dead && boss && boss.state !== 'wait' && overlap(b, boss) && !b.hit.has(boss)) {
+        damageBoss(b, b.dmg); b.hit.add(boss); spark(b.x + b.w / 2, b.y + b.h / 2);
+        if (b.kind !== 'thorn') b.dead = true;
+      }
+    } else if (overlap(b, P)) { hurtPlayer(b.dmg, b.x + b.w / 2); if (P.inv > 0) b.dead = true; }
+  }
+  bullets = bullets.filter(b => !b.dead);
+}
+
+function updatePickups() {
+  for (const k of pickups) {
+    k.vy = Math.min(k.vy + GRAV, 4); moveY(k, k.vy); if (k.onGround) k.vy = 0;
+    if (k.life > 0 && --k.life === 0) k.dead = true;
+    if (k.y > LH * TS + 20) k.dead = true;
+    if (!k.dead && overlap(k, P)) { k.dead = true; P.hp = Math.min(P.maxHp, P.hp + (k.kind === 'big' ? 8 : 3)); sfx.pickup(); spark(k.x + k.w / 2, k.y + k.h / 2, '#8ff5dc'); }
+  }
+  pickups = pickups.filter(k => !k.dead);
+}
+function updatePlats() {
+  for (const pl of plats) {
+    pl.t++; const d = pl.d, u = 0.5 - 0.5 * Math.cos(pl.t * 6.2832 / d.period);
+    const nx = d.kind === 'h' ? d.a + (d.b - d.a) * u : d.x, ny = d.kind === 'v' ? d.b + (d.a - d.b) * u : d.y;
+    pl.dx = nx - pl.x; pl.dy = ny - pl.y; pl.x = nx; pl.y = ny;
+  }
+}
+function updateCheckpoints() {
+  cps.forEach((c, i) => {
+    if (!c.on && overlap(c, P)) { c.on = true; cpIndex = Math.max(cpIndex, i); sfx.check(); msg = { s: 'CHECKPOINT', t: 90 }; }
+  });
+}
+
+/* ---------------------------------------------------------------------
+   11. BOSS: VEXA THORNCLAW (kalajengking)
+   Pola: tembakan ekor, menerjang, menjatuhkan duri dari atap.
+   Di bawah 50% HP: lebih cepat, lebih banyak proyektil, terjangan ganda.
+   --------------------------------------------------------------------- */
+const TAIL = {
+  rest: [[-20, 6], [-24, 0], [-24, -7], [-20, -13], [-14, -17], [-7, -18], [0, -16]],
+  fwd:  [[-20, 6], [-23, 0], [-21, -7], [-15, -12], [-8, -14], [0, -13], [8, -9]],
+  up:   [[-20, 6], [-23, 0], [-24, -7], [-24, -14], [-23, -21], [-22, -28], [-21, -35]]
+};
+function bossTail(b) {
+  const A = TAIL.rest, B = TAIL[b.tailPose] || A, u = b.tailU;
+  return A.map((a, i) => [Math.round(a[0] + (B[i][0] - a[0]) * u), Math.round(a[1] + (B[i][1] - a[1]) * u)]);
+}
+function bossTailTip(b) { const s = bossTail(b)[6]; return { x: b.x + 22 + b.face * (s[0] + 5), y: b.y + s[1] + 3 }; }
+
+function enterBossRoom() {
+  bossLock = true; door.closed = true; sfx.door(); setMusic(null);
+  fill(DOOR_COL, 12, 1, 3, 4);
+  boss = { x: ROOM_R - 80, y: CEIL + 2, w: 44, h: 26, vx: 0, vy: 0, face: -1, hp: 32, maxHp: 32, hpShow: 0, inv: 0,
+    state: 'wait', t: 0, last: '', tailPose: 'rest', tailU: 0, walkT: 0, claw: 0, fired: 0, again: false, raged: false, landed: false };
+}
+function bossSetState(s) { boss.state = s; boss.t = 0; boss.fired = 0; }
+function bossChoose() {
+  const opts = ['tail', 'charge', 'drop'].filter(s => s !== boss.last);
+  const s = boss.last === '' ? 'tail' : opts[(Math.random() * opts.length) | 0];
+  boss.last = s; boss.again = boss.raged && s === 'charge'; bossSetState(s);
+}
+function updateBoss() {
+  const b = boss; if (!b) return;
+  b.t++; if (b.inv > 0) b.inv--;
+  const rage = b.raged, pcx = P.x + 6, bcx = b.x + 22;
+  let pose = 'rest';
+  switch (b.state) {
+    case 'wait': if (b.t > 50) { bossSetState('intro'); setMusic('boss'); } break;
+    case 'intro':
+      if (!b.landed) {
+        b.vy += 0.3; b.y += b.vy;
+        if (b.y >= FLOOR - b.h) { b.y = FLOOR - b.h; b.landed = true; b.t = 0; shake = 10; sfx.thud(); dust(b.x + 4, FLOOR, -1); dust(b.x + 40, FLOOR, 1); }
+      } else {
+        if (b.t === 20) sfx.roar();
+        if (b.t > 30 && b.hpShow < b.maxHp) { b.hpShow += 0.5; if (b.t % 4 === 0) sfx.tick(); }
+        b.claw = (b.t >> 3) & 1 ? 3 : 0;
+        if (b.hpShow >= b.maxHp && b.t > 110) bossSetState('idle');
+      }
+      break;
+    case 'idle':
+      b.face = pcx < bcx ? -1 : 1; b.claw = 0;
+      if (Math.abs(pcx - bcx) > 70) { b.x += b.face * (rage ? 0.9 : 0.5); b.walkT += 0.3; }
+      if (b.t > (rage ? 32 : 70)) bossChoose();
+      break;
+    case 'tail': {                                    // Pola 1: tembakan ekor terarah
+      pose = 'fwd'; b.face = pcx < bcx ? -1 : 1;
+      const n = rage ? 5 : 3, iv = rage ? 14 : 20;
+      if (b.t >= 30 && (b.t - 30) % iv === 0 && b.fired < n) {
+        b.fired++; const tip = bossTailTip(b), sp = rage ? 3.2 : 2.6;
+        const a = Math.atan2(P.y + 11 - tip.y, pcx - tip.x);
+        bullets.push({ kind: 'b', friendly: false, x: tip.x - 3, y: tip.y - 3, w: 7, h: 7, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, dmg: 3, t: 0 });
+        sfx.shootMid(); spark(tip.x, tip.y, '#ff9a2e');
+      }
+      if (b.t > 30 + n * iv + 24) bossSetState('idle');
+      break;
+    }
+    case 'charge': {                                  // Pola 2: menerjang sampai menabrak dinding
+      const wind = b.fired ? 16 : (rage ? 24 : 38);   // fired dipakai sebagai penanda terjangan kedua
+      if (b.t < wind) { b.x = clamp(b.x - b.face * 0.3, ROOM_L, ROOM_R - b.w); b.claw = (b.t >> 2) & 1 ? 3 : 0; if (b.t === 1) sfx.warn(); }
+      else {
+        if (b.t === wind) sfx.dash();
+        b.x += b.face * (rage ? 4.6 : 3.6); b.walkT += 0.8; b.claw = 3;
+        if (frame % 3 === 0) dust(b.x + 22 - b.face * 20, FLOOR, -b.face);
+        if (b.x <= ROOM_L || b.x + b.w >= ROOM_R) {
+          b.x = clamp(b.x, ROOM_L, ROOM_R - b.w); shake = 8; sfx.thud(); bossSetState('stun');
+        }
+      }
+      break;
+    }
+    case 'stun':
+      b.claw = 0;
+      if (b.t > (rage ? 16 : 34)) {
+        if (b.again) { b.again = false; b.face = -b.face; bossSetState('charge'); b.fired = 1; }
+        else bossSetState('idle');
+      }
+      break;
+    case 'drop': {                                    // Pola 3: ekor menghantam atap, duri berjatuhan
+      pose = 'up';
+      if (b.t === 28) {
+        sfx.thud(); shake = 6;
+        const n = rage ? 7 : 4, gap = rage ? 9 : 13;
+        for (let i = 0; i < n; i++) {
+          const x = i === 0 ? pcx - 3 : rnd(ROOM_L + 6, ROOM_R - 12);
+          thorns.push({ x: clamp(x, ROOM_L + 2, ROOM_R - 8), y: CEIL, w: 6, h: 12, vy: 0, t: 0, delay: i * gap });
+        }
+        const tip = bossTailTip(b); for (let i = 0; i < 6; i++) part(tip.x, tip.y, rnd(-1, 1), rnd(-3, -1), 14, '#ff9a2e', 2);
+      }
+      if (b.t > (rage ? 60 : 95)) bossSetState('idle');
+      break;
+    }
+    case 'dying':
+      if (b.t % 6 === 0) { explosion(b.x + rnd(0, b.w), b.y + rnd(-14, b.h), b.t % 18 === 0); sfx.explode(); shake = 4; }
+      if (b.t === 150) { sfx.bigBoom(); flashT = 30; explosion(b.x + 22, b.y + 10, true); }
+      if (b.t > 180) { thornUnlocked = true; state = 'weaponget'; stateT = 0; sfx.getWeapon(); }
+      break;
+  }
+  b.tailPose = pose === 'rest' ? b.tailPose : pose;
+  b.tailU = clamp(b.tailU + (pose === 'rest' ? -0.08 : 0.1), 0, 1);
+  b.x = clamp(b.x, ROOM_L, ROOM_R - b.w);
+  if (rage && frame % 8 === 0 && b.state !== 'dying') part(b.x + rnd(4, 40), b.y + 6, 0, -0.5, 16, '#ff5a3c', 2);
+  if (b.state !== 'wait' && b.state !== 'dying' && !(b.state === 'intro' && !b.landed) && overlap(b, P)) hurtPlayer(4, bcx);
+
+  // Duri jatuh dari atap (dengan penanda peringatan)
+  for (const th of thorns) {
+    th.t++;
+    if (th.t === th.delay + 1) sfx.warn();
+    if (th.t > th.delay + 34) {
+      th.vy = Math.min(th.vy + 0.3, 5.5); th.y += th.vy;
+      if (overlap(th, P)) hurtPlayer(3, th.x + 3);
+      if (th.y + th.h >= FLOOR) { th.dead = true; spark(th.x + 3, FLOOR - 2, '#ff9a2e'); sfx.land(); }
+    }
+  }
+  thorns = thorns.filter(t => !t.dead);
+}
+
+/* ---------------------------------------------------------------------
+   12. UPDATE UTAMA
+   --------------------------------------------------------------------- */
+function updateCamera() {
+  if (bossLock) {
+    cam.x += (BOSS_CAM - cam.x) * 0.1; if (Math.abs(BOSS_CAM - cam.x) < 0.5) cam.x = BOSS_CAM;
+  } else {
+    cam.look += (P.face * 22 - cam.look) * 0.05;
+    cam.x += (P.x + 6 - W / 2 + cam.look - cam.x) * 0.14;
+    cam.x = clamp(cam.x, 0, ROOM_L - W);
+  }
+  cam.y += (P.y + 11 - H / 2 - 10 - cam.y) * 0.12;
+  cam.y = clamp(cam.y, 0, LH * TS - H);
+}
+function updatePlay() {
+  playTime++;
+  updatePlats();
+  updatePlayer();
+  if (state !== 'play') return;
+  updateEnemies(); updateBullets(); updatePickups(); updateCheckpoints();
+  if (!bossLock && P.x > ROOM_L + 6) enterBossRoom();
+  if (door.closed && door.h < 48) door.h += 2;
+  updateBoss();
+  updateParticles();
+  updateCamera();
+}
+function autoPause() { if (state === 'play') { state = 'pause'; } }
+function update() {
+  frame++; pollInput();
+  if (shake > 0) shake *= 0.85; if (shake < 0.3) shake = 0;
+  if (flashT > 0) flashT--;
+  if (msg.t > 0) msg.t--;
+  stateT++;
+  switch (state) {
+    case 'title': if (anyConfirm()) { audioInit(); sfx.menu(); startGame(); } break;
+    case 'play': if (pressed.pause) { state = 'pause'; sfx.menu(); } else updatePlay(); break;
+    case 'pause': if (pressed.pause) { state = 'play'; sfx.menu(); } break;
+    case 'dying': updateParticles(); if (stateT > 100) { state = 'gameover'; stateT = 0; } break;
+    case 'gameover': if (stateT > 30 && anyConfirm()) { sfx.menu(); resetLevel(); state = 'play'; msg = { s: 'READY', t: 60 }; } break;
+    case 'weaponget': if ((stateT > 90 && anyConfirm()) || stateT > 420) { state = 'clear'; stateT = 0; sfx.fanfare(); } break;
+    case 'clear': if (stateT > 90 && anyConfirm()) { sfx.menu(); if (P) P.weapon = 1; startGame(); } break;
+  }
+  if (state === 'play') musicTick();
+}
+
+/* ---------------------------------------------------------------------
+   13. GAMBAR SPRITE (semua pixel art dibuat dari persegi kecil)
+   --------------------------------------------------------------------- */
+const PAL_PULSE = { A: '#1fc8a8', D: '#0e7f78', L: '#8ff5dc', S: '#ffd7a8', K: '#0b2b36', G: '#ffe14d', S1: '#ff5fa2', S2: '#ffd24d' };
+const PAL_THORN = { A: '#b565dc', D: '#6a2e8f', L: '#ecc0ff', S: '#ffd7a8', K: '#1f0b36', G: '#ff9a2e', S1: '#ff9a2e', S2: '#fff06a' };
+const PAL_CH1 = { A: '#b8fff0', D: '#5fe0c8', L: '#ffffff', S: '#ffffff', K: '#0e7f78', G: '#ffffff', S1: '#ffffff', S2: '#8ff5dc' };
+const PAL_CH2 = { A: '#fff3a0', D: '#ffb84d', L: '#ffffff', S: '#ffffff', K: '#b0562a', G: '#ffffff', S1: '#ff8ad0', S2: '#ffffff' };
+const monoPal = c => ({ A: c, D: c, L: c, S: c, K: c, G: c, S1: c, S2: c });
+const PAL_GHOST = monoPal('#5fe0c8');
+
+// Rana: sx,sy = pojok kiri-atas hitbox (12x22) di layar
+function drawRana(sx, sy, face, pose, anim, pal, shooting) {
+  const cx = sx + 6, top = sy - 2;
+  const r = (dx, dy, w, h, c) => { ctx.fillStyle = c; ctx.fillRect(face > 0 ? cx + dx : cx - dx - w, top + dy, w, h); };
+  let ox = 0, oy = 0;
+  // Kaki
+  if (pose === 'dash') {
+    ox = 2; oy = 5;
+    r(-10, 17, 8, 3, pal.A); r(-13, 17, 4, 3, pal.L); r(-8, 21, 7, 3, pal.D); r(-11, 21, 4, 3, pal.L);
+  } else if (pose === 'run') {
+    const f = ((anim / 5) | 0) % 4; if (f & 1) oy = 1;
+    if (f === 0) { r(-6, 14, 3, 5, pal.D); r(-8, 18, 4, 3, pal.L); r(2, 14, 3, 6, pal.A); r(3, 20, 4, 4, pal.L); }
+    else if (f === 2) { r(-5, 14, 3, 6, pal.A); r(-6, 20, 4, 4, pal.L); r(2, 14, 3, 4, pal.D); r(4, 17, 4, 3, pal.L); }
+    else { r(-3, 15, 3, 5, pal.D); r(-3, 20, 4, 4, pal.L); r(0, 15, 3, 4, pal.A); r(0, 18, 4, 3, pal.L); }
+  } else if (pose === 'jump') {
+    r(-4, 14, 3, 5, pal.D); r(-5, 18, 4, 3, pal.L); r(1, 14, 3, 7, pal.A); r(1, 20, 4, 3, pal.L);
+  } else if (pose === 'fall' || pose === 'hurt' || pose === 'slide') {
+    r(-5, 14, 3, 6, pal.D); r(-6, 20, 4, 3, pal.L); r(2, 14, 3, 5, pal.A); r(3, 19, 4, 3, pal.L);
+  } else {
+    r(-4, 14, 3, 6, pal.A); r(-5, 20, 4, 4, pal.L); r(1, 14, 3, 6, pal.A); r(1, 20, 4, 4, pal.L);
+  }
+  const R = (dx, dy, w, h, c) => r(dx + ox, dy + oy, w, h, c);
+  // Lengan belakang
+  if (pose === 'slide') R(-8, 5, 4, 3, pal.A); else if (pose === 'hurt') R(-7, 5, 3, 4, pal.A); else R(-6, 8, 2, 5, pal.D);
+  // Badan
+  R(-4, 7, 8, 7, pal.D); R(-3, 8, 6, 3, pal.A); R(-1, 9, 2, 2, pal.G); R(-4, 13, 8, 1, pal.K);
+  // Helm + wajah
+  R(-4, 0, 8, 7, pal.A); R(-4, 0, 8, 1, pal.L); R(-5, 2, 1, 4, pal.D); R(-1, -1, 3, 1, pal.L);
+  R(0, 3, 4, 3, pal.S); R(2, 4, 1, 1, pal.K); R(0, 2, 4, 1, pal.D); R(-3, 2, 2, 2, pal.G);
+  // Lengan depan / Pulse Blaster
+  if (shooting || pose === 'dash') { R(1, 8, 7, 4, pal.A); R(7, 7, 3, 6, pal.L); R(9, 9, 1, 2, pal.G); }
+  else if (pose === 'hurt') R(4, 5, 3, 4, pal.A);
+  else { R(2, 8, 3, 5, pal.A); R(2, 12, 3, 2, pal.L); }
+}
+function drawScarf(pts, ox, oy, pal) {
+  for (let i = pts.length - 1; i >= 0; i--) rect(Math.round(pts[i].x) - ox - 1, Math.round(pts[i].y) - oy, 3, 2, i < 4 ? pal.S1 : pal.S2);
+}
+
+function drawEnemy(e, cx, cy) {
+  const x = Math.round(e.x) - cx, y = Math.round(e.y) - cy, fl = e.flash > 0, c = k => fl ? '#ffffff' : k;
+  if (e.type === 'drone') {
+    rect(x + 6, y + 1, 2, 2, c('#55606b'));
+    rect((e.t >> 1) & 1 ? x : x + 4, y, (e.t >> 1) & 1 ? 14 : 6, 1, c('#cfe0e8'));
+    rect(x + 2, y + 3, 10, 8, c('#6f8296')); rect(x + 1, y + 5, 12, 4, c('#8ea2b6')); rect(x + 2, y + 10, 10, 1, c('#3c4a58'));
+    rect(x + 3, y + 3, 4, 1, c('#4fd067'));
+    rect(x + 5 + e.face * 2, y + 5, 4, 3, c('#ff4d4d')); rect(x + 6 + e.face * 3, y + 6, 1, 1, c('#ffd0d0'));
+    rect(x + 4, y + 11, 2, 1, c('#ffb84d')); rect(x + 8, y + 11, 2, 1, c('#ffb84d'));
+  } else if (e.type === 'turret') {
+    rect(x, y + 9, 14, 5, c('#2f3d4a')); rect(x, y + 9, 14, 1, c('#5b7284'));
+    rect(x + 2, y + 2, 10, 8, c('#a86a3a')); rect(x + 2, y + 2, 10, 2, c('#d49050')); rect(x + 3, y + 1, 8, 1, c('#d49050'));
+    rect(e.face > 0 ? x + 10 : x - 4, y + 4, 8, 3, c('#55606b')); rect(e.face > 0 ? x + 17 : x - 5, y + 3, 2, 5, c('#8ea2b6'));
+    rect(x + 5, y + 4, 4, 3, c(e.cd < 22 && (e.cd >> 2) & 1 ? '#ffffff' : '#ff4d4d'));
+    rect(x + 1, y + 11, 2, 1, c('#4fd067'));
+  } else {
+    const air = !e.onGround;
+    rect(x + 1, y + (air ? 0 : 2), 12, 8, c('#c9a13b')); rect(x + 1, y + (air ? 0 : 2), 12, 2, c('#f0cf6a')); rect(x + 1, y + (air ? 7 : 9), 12, 1, c('#7d6220'));
+    const ex = e.face > 0 ? 2 : 0;
+    rect(x + 3 + ex, y + (air ? 3 : 5), 2, 2, c('#ff4d4d')); rect(x + 7 + ex, y + (air ? 3 : 5), 2, 2, c('#ff4d4d'));
+    if (air) { rect(x + 2, y + 8, 2, 5, c('#55606b')); rect(x + 10, y + 8, 2, 5, c('#55606b')); rect(x + 1, y + 13, 4, 1, c('#8ea2b6')); rect(x + 9, y + 13, 4, 1, c('#8ea2b6')); }
+    else { rect(x, y + 10, 5, 2, c('#55606b')); rect(x + 9, y + 10, 5, 2, c('#55606b')); rect(x, y + 12, 5, 2, c('#8ea2b6')); rect(x + 9, y + 12, 5, 2, c('#8ea2b6')); }
+  }
+}
+
+function drawBoss(cx, cy) {
+  const b = boss; if (!b || b.state === 'wait') return;
+  if (b.state === 'dying' && b.t > 150) return;
+  const fl = (b.inv > 0 && (b.inv >> 1) & 1) || (b.state === 'dying' && (b.t >> 2) & 1), rage = b.raged;
+  const C = fl ? { s: '#fff', d: '#fff', l: '#fff', a: '#fff', e: '#fff' }
+    : { s: rage ? '#9a2e62' : '#7a2e8f', d: '#3d1450', l: rage ? '#ff7ab8' : '#c66be0', a: '#ff9a2e', e: rage ? '#ff3030' : '#fff34d' };
+  const mx = Math.round(b.x) + 22 - cx, top = Math.round(b.y) - cy, f = b.face;
+  const r = (dx, dy, w, h, c) => { ctx.fillStyle = c; ctx.fillRect(f > 0 ? mx + dx : mx - dx - w, top + dy, w, h); };
+  // Ekor
+  const sg = bossTail(b);
+  for (let i = 0; i < 6; i++) { r(sg[i][0], sg[i][1], 6, 6, C.s); r(sg[i][0] + 1, sg[i][1] + 1, 2, 2, C.l); r(sg[i][0], sg[i][1] + 5, 6, 1, C.d); }
+  const s = sg[6], glow = (b.state === 'tail' || b.state === 'drop') && b.t < 30 && (b.t >> 1) & 1;
+  r(s[0], s[1], 6, 6, glow ? '#ffffff' : C.a);
+  if (b.tailPose === 'up' && b.tailU > 0.5) { r(s[0] + 1, s[1] - 4, 4, 4, C.a); r(s[0] + 2, s[1] - 7, 2, 3, '#fff0c0'); }
+  else { r(s[0] + 5, s[1] + 3, 3, 4, C.a); r(s[0] + 7, s[1] + 6, 2, 3, '#fff0c0'); }
+  // Kaki
+  for (let i = 0; i < 3; i++) { const ph = Math.round(Math.sin(b.walkT + i * 2.1) * 2); r(-15 + i * 10 + ph, 20, 2, 5, C.d); r(-16 + i * 10 + ph, 25, 4, 1, C.l); }
+  // Badan bersegmen + duri punggung
+  r(-18, 9, 30, 12, C.s); r(-18, 9, 30, 2, C.l); r(-18, 19, 30, 2, C.d);
+  r(-9, 11, 1, 8, C.d); r(-1, 11, 1, 8, C.d); r(7, 11, 1, 8, C.d);
+  r(-14, 6, 2, 3, C.a); r(-6, 6, 2, 3, C.a); r(2, 6, 2, 3, C.a);
+  // Kepala
+  r(10, 7, 11, 13, C.s); r(10, 7, 11, 2, C.l); r(14, 11, 5, 3, C.e); r(17, 12, 2, 2, fl ? '#fff' : '#2a0010'); r(19, 17, 3, 3, C.d);
+  // Capit
+  const co = b.claw | 0;
+  r(12, 19, 8, 3, C.d); r(19, 12 - co, 9, 4, C.l); r(26, 14 - co, 2, 4, C.l); r(19, 19, 9, 4, C.s); r(26, 17, 2, 3, C.s);
+}
+
+function drawBullet(b, cx, cy) {
+  const x = Math.round(b.x) - cx, y = Math.round(b.y) - cy, k = (b.t >> 1) & 1;
+  switch (b.kind) {
+    case 'p0': rect(x + 1, y, 4, 4, '#ffe14d'); rect(x, y + 1, 6, 2, '#fff7a8'); rect(x + 2, y + 1, 2, 2, '#ffffff'); break;
+    case 'p1':
+      rect(x + 2, y, 6, 8, '#2de0b0'); rect(x, y + 2, 10, 4, '#2de0b0'); rect(x + 2, y + 2, 6, 4, k ? '#ffffff' : '#b8fff0');
+      rect(b.vx > 0 ? x - 4 : x + 10, y + 3, 4, 2, '#1fc8a8'); break;
+    case 'p2':
+      rect(x + 4, y, 10, 14, k ? '#ff8ad0' : '#2de0b0'); rect(x, y + 3, 18, 8, k ? '#ff8ad0' : '#2de0b0');
+      rect(x + 3, y + 2, 12, 10, '#b8fff0'); rect(x + 5, y + 4, 8, 6, '#ffffff');
+      rect(b.vx > 0 ? x - 8 : x + 18, y + 4, 8, 2, '#8ff5dc'); rect(b.vx > 0 ? x - 5 : x + 18, y + 9, 5, 2, '#ffe14d'); break;
+    case 'thorn': {
+      const d = b.vx > 0 ? 1 : -1;
+      rect(x, y + 1, 8, 2, '#ff9a2e'); rect(d > 0 ? x + 5 : x, y, 3, 4, '#ffe9b0'); rect(d > 0 ? x - 2 : x + 8, y + 1, 2, 2, '#b565dc'); break;
+    }
+    case 'e': rect(x + 1, y, 3, 5, '#ff5a3c'); rect(x, y + 1, 5, 3, '#ff5a3c'); rect(x + 1, y + 1, 3, 3, k ? '#ffe14d' : '#ffffff'); break;
+    case 'b': rect(x + 1, y, 5, 7, '#c66be0'); rect(x, y + 1, 7, 5, '#c66be0'); rect(x + 1, y + 1, 5, 5, k ? '#ff9a2e' : '#ffe14d'); rect(x + 2, y + 2, 3, 3, '#ffffff'); break;
+  }
+}
+function drawPickup(k, cx, cy) {
+  if (k.life > 0 && k.life < 120 && (k.life >> 2) & 1) return;
+  const x = Math.round(k.x) - cx, y = Math.round(k.y) - cy, g = (frame >> 3) & 1 ? '#8ff5dc' : '#2de0b0';
+  if (k.kind === 'big') {
+    rect(x + 1, y, 10, 12, '#e8f4f8'); rect(x, y + 2, 12, 8, '#e8f4f8'); rect(x + 2, y + 2, 8, 8, '#0e7f78');
+    rect(x + 5, y + 3, 2, 6, g); rect(x + 3, y + 5, 6, 2, g); rect(x, y + 10, 12, 1, '#8ea2b6');
+  } else {
+    rect(x + 1, y, 6, 8, '#e8f4f8'); rect(x, y + 1, 8, 6, '#e8f4f8'); rect(x + 2, y + 2, 4, 4, g);
+  }
+}
+function drawPlat(pl, cx, cy) {
+  const x = Math.round(pl.x) - cx, y = Math.round(pl.y) - cy;
+  rect(x, y, 32, 6, '#55606b'); rect(x, y, 32, 2, '#aab8c2'); rect(x, y + 5, 32, 1, '#2a3844');
+  rect(x + 3, y + 3, 2, 1, '#2de0b0'); rect(x + 27, y + 3, 2, 1, '#2de0b0'); rect(x + 12, y + 2, 8, 2, '#3fb85a');
+  const fh = 2 + ((frame >> 2) & 1) * 2;
+  rect(x + 5, y + 6, 4, fh, '#ffb84d'); rect(x + 23, y + 6, 4, fh, '#ffb84d'); rect(x + 6, y + 6, 2, fh + 1, '#fff7a8'); rect(x + 24, y + 6, 2, fh + 1, '#fff7a8');
+}
+function drawCheckpoint(c, cx, cy) {
+  const x = Math.round(c.x) - cx, y = c.y - cy;
+  rect(x + 5, y + 8, 2, 20, '#8ea2b6'); rect(x + 2, y + 26, 8, 2, '#55606b');
+  rect(x + 2, y, 8, 8, '#2a3844'); rect(x + 3, y + 1, 6, 6, c.on ? ((frame >> 3) & 1 ? '#8ff5dc' : '#2de0b0') : '#7a3030');
+  if (c.on) { const r = (frame >> 2) % 8; rect(x + 5 - r, y + 3, 1, 2, '#8ff5dc'); rect(x + 6 + r, y + 3, 1, 2, '#8ff5dc'); }
+}
+
+/* ---------------------------------------------------------------------
+   14. RENDER DUNIA, HUD, DAN LAYAR MENU
+   --------------------------------------------------------------------- */
+function drawBackground(cx, cy) {
+  ctx.drawImage(skyCv, 0, 0);
+  let ox = -mod(cx * 0.2, 512), oy = Math.round((LH * TS - H - cy) * 0.15);
+  ctx.drawImage(farCv, Math.round(ox), oy); ctx.drawImage(farCv, Math.round(ox) + 512, oy);
+  for (let i = 0; i < 22; i++) {                       // kunang-kunang
+    if (Math.sin(frame * 0.05 + i * 1.7) < 0.1) continue;
+    const x = mod(i * 97 + Math.sin(frame * 0.011 + i) * 22 - cx * 0.35, W), y = 24 + (i * 53) % 150 + Math.sin(frame * 0.02 + i * 2) * 6;
+    rect(x | 0, y | 0, 1, 1, '#d8ff7a');
+  }
+  ox = -mod(cx * 0.5, 512); oy = Math.round((LH * TS - H - cy) * 0.35);
+  ctx.drawImage(midCv, Math.round(ox), oy); ctx.drawImage(midCv, Math.round(ox) + 512, oy);
+}
+function drawBar(x, y, units, uh, val, c1, c2, label) {
+  const h = units * uh + 3;
+  rect(x, y, 9, h, '#04121a'); rect(x + 1, y + 1, 7, h - 2, '#1c2a34');
+  for (let i = 0; i < val; i++) { const yy = y + 2 + (units - 1 - i) * uh; rect(x + 2, yy, 5, uh - 1, c1); rect(x + 2, yy, 2, uh - 1, c2); }
+  rect(x, y + h, 9, 7, '#04121a'); text(label, x + 3, y + h + 1, c2);
+}
+function drawHUD() {
+  const p = P;
+  drawBar(8, 8, 16, 3, p.hp, '#2de0b0', '#b8fff0', 'R');
+  if (p.weapon === 1) drawBar(19, 8, 12, 4, Math.ceil(p.energy / 2), '#ff9a2e', '#ffe9b0', 'T');
+  if (boss && boss.state !== 'wait') drawBar(W - 17, 8, 16, 4, Math.ceil(boss.hpShow === boss.maxHp ? boss.hp / 2 : boss.hpShow / 2), '#c66be0', '#ffb8f0', 'V');
+  if (boss && boss.state === 'intro' && boss.landed) textS('VEXA THORNCLAW', W / 2, 60, '#ff9a2e', 2, 1);
+  if (thornUnlocked) textS(p.weapon ? 'THORN' : 'PULSE', 32, 8, p.weapon ? '#ff9a2e' : '#8ff5dc');
+  if (msg.t > 0 && (msg.t > 20 || (msg.t >> 1) & 1)) textS(msg.s, W / 2, 84, '#ffffff', 2, 1);
+  if (muted) text('MUTE', W - 30, H - 8, '#8ea2b6');
+}
+function drawWorld() {
+  const sx = shake ? Math.round(rnd(-shake, shake)) : 0, sy = shake ? Math.round(rnd(-shake, shake) * 0.6) : 0;
+  const cx = clamp(Math.round(cam.x) + sx, 0, LW * TS - W), cy = clamp(Math.round(cam.y) + sy, 0, LH * TS - H);
+  drawBackground(cx, cy);
+  ctx.drawImage(levelCv, cx, cy, W, H, 0, 0, W, H);
+  // Pintu boss (rolling door turun dari atas)
+  if (door.h > 0) {
+    const dx = DOOR_COL * TS - cx, dy = 12 * TS - cy;
+    rect(dx + 2, dy, 12, door.h, '#55606b');
+    for (let y = 0; y < door.h; y += 6) { rect(dx + 2, dy + y, 12, 1, '#aab8c2'); rect(dx + 2, dy + y + 5, 12, 1, '#2a3844'); }
+    rect(dx + 2, dy + door.h - 3, 12, 3, '#e8b83c');
+  }
+  for (const c of cps) drawCheckpoint(c, cx, cy);
+  for (const pl of plats) drawPlat(pl, cx, cy);
+  for (const k of pickups) drawPickup(k, cx, cy);
+  for (const e of enemies) if (!e.dead && e.x > cx - 24 && e.x < cx + W + 24) drawEnemy(e, cx, cy);
+  drawBoss(cx, cy);
+  for (const th of thorns) {
+    const x = Math.round(th.x) - cx;
+    if (th.t <= th.delay) continue;
+    if (th.t <= th.delay + 34) { if ((th.t >> 2) & 1) { rect(x, CEIL - cy, 6, 2, '#ff3030'); rect(x + 2, CEIL - cy + 3, 2, 4, '#ff3030'); rect(x + 2, CEIL - cy + 8, 2, 2, '#ff3030'); } }
+    else { const y = Math.round(th.y) - cy; rect(x, y, 6, 4, '#7a2e8f'); rect(x + 1, y + 4, 4, 4, '#ff9a2e'); rect(x + 2, y + 8, 2, 4, '#fff0c0'); }
+  }
+  // Pemain
+  if (state !== 'dying' && state !== 'gameover') {
+    const p = P, base = p.weapon ? PAL_THORN : PAL_PULSE;
+    ctx.globalAlpha = 0.45;
+    for (const g of p.ghosts) drawRana(Math.round(g.x) - cx, Math.round(g.y) - cy, g.face, g.pose, 0, PAL_GHOST, false);
+    ctx.globalAlpha = 1;
+    if (!(p.inv > 0 && (p.inv >> 1) & 1)) {
+      let pal = base;
+      if (p.charge >= CH2 && (frame >> 1) & 1) pal = PAL_CH2; else if (p.charge >= CH1 && (frame >> 2) & 1) pal = PAL_CH1;
+      drawScarf(p.scarf, cx, cy, pal);
+      drawRana(Math.round(p.x) - cx, Math.round(p.y) - cy, p.face, p.pose, p.anim, pal, p.shootT > 0);
+      if (p.charge >= CH1) {                          // kilau di moncong blaster
+        const o = playerShotOrigin(p, 0, 0), s = p.charge >= CH2 ? 3 + ((frame >> 1) & 1) * 2 : 2 + ((frame >> 2) & 1);
+        rect(Math.round(o.x) - cx - (s >> 1), Math.round(o.y) - cy - (s >> 1), s, s, p.charge >= CH2 ? '#ffe14d' : '#ffffff');
+      }
+    }
+  }
+  for (const b of bullets) drawBullet(b, cx, cy);
+  for (const q of particles) { const s = Math.max(1, Math.round(q.size * q.life / q.max)); rect(Math.round(q.x) - cx - (s >> 1), Math.round(q.y) - cy - (s >> 1), s, s, q.color); }
+  if (flashT > 0) { ctx.globalAlpha = Math.min(1, flashT / 12); rect(0, 0, W, H, '#ffffff'); ctx.globalAlpha = 1; }
+  drawHUD();
+}
+function dim(a) { ctx.globalAlpha = a; rect(0, 0, W, H, '#020a0e'); ctx.globalAlpha = 1; }
+function fakeScarf(x, y, face) { const pts = []; for (let i = 0; i < 7; i++) pts.push({ x: x - face * i * 3, y: y + Math.sin(frame * 0.2 + i * 0.9) * (i * 0.5) }); return pts; }
+
+function drawTitle() {
+  drawBackground(frame * 0.6, 40);
+  rect(0, 176, W, 40, '#0a2a30'); rect(0, 176, W, 2, '#4fd067'); rect(0, 178, W, 2, '#2f9e4c');
+  text('RANA', W / 2 + 3, 31, '#04121a', 9, 1); text('RANA', W / 2, 28, '#1fc8a8', 9, 1);
+  ctx.save(); ctx.beginPath(); ctx.rect(0, 28, W, 18); ctx.clip(); text('RANA', W / 2, 28, '#8ff5dc', 9, 1); ctx.restore();
+  textS('PENJAGA RIMBA BAJA', W / 2, 80, '#ffe14d', 2, 1);
+  textS('RIMBA VERDANIA DITELAN PABRIK LIAR.', W / 2, 100, '#b9d8d0', 1, 1);
+  textS('RANA, ANDROID PENJAGA TERAKHIR, BANGKIT.', W / 2, 108, '#b9d8d0', 1, 1);
+  drawScarf(fakeScarf(W / 2 - 4, 160, 1), 0, 0, PAL_PULSE);
+  drawRana(W / 2 - 6, 154, 1, 'stand', 0, PAL_PULSE, false);
+  if ((frame >> 4) & 1) textS(isTouch ? 'SENTUH LAYAR UNTUK MULAI' : 'TEKAN ENTER UNTUK MULAI', W / 2, 128, '#ffffff', 1, 1);
+  text('PANAH/WASD: GERAK   Z/SPASI: LOMPAT   X: TEMBAK (TAHAN=CHARGE)', W / 2, 186, '#8ff5dc', 1, 1);
+  text('C/SHIFT: DASH   Q/E: GANTI SENJATA   ENTER: PAUSE   M: SUARA', W / 2, 195, '#8ff5dc', 1, 1);
+  text(thornUnlocked ? 'THORN SHOT TERBUKA!' : 'DEMO 1 STAGE', W / 2, 206, thornUnlocked ? '#ff9a2e' : '#5fa8a8', 1, 1);
+}
+function fmtTime(f) { const s = (f / 60) | 0; return ((s / 60) | 0) + ':' + String(s % 60).padStart(2, '0'); }
+function render() {
+  if (state === 'title') { drawTitle(); return; }
+  if (state === 'weaponget') {
+    rect(0, 0, W, H, '#0a0614');
+    for (let i = 0; i < 12; i++) rect(0, mod(i * 20 + frame, 240) - 12, W, 2, '#1c1030');
+    textS('SENJATA BARU DIPEROLEH', W / 2, 30, '#ffffff', 2, 1);
+    const pal = (stateT > 50 || (stateT >> 2) & 1) ? PAL_THORN : PAL_PULSE;
+    ctx.save(); ctx.translate(W / 2 - 18, 70); ctx.scale(3, 3);
+    drawScarf(fakeScarf(2, 6, 1), 0, 0, pal); drawRana(0, 2, 1, 'stand', 0, pal, true); ctx.restore();
+    if (stateT > 50) {
+      textS('THORN SHOT', W / 2, 152, '#ff9a2e', 3, 1);
+      text('TIGA DURI MENYEBAR YANG MENEMBUS MUSUH', W / 2, 176, '#ecc0ff', 1, 1);
+      text('GANTI SENJATA DENGAN Q / E', W / 2, 185, '#ecc0ff', 1, 1);
+    }
+    if (stateT > 90 && (frame >> 4) & 1) text('TEKAN ENTER', W / 2, 202, '#ffffff', 1, 1);
+    return;
+  }
+  if (state === 'clear') {
+    drawBackground(frame * 0.4, 40); dim(0.45);
+    textS('STAGE CLEAR', W / 2, 40, '#ffe14d', 4, 1);
+    textS('VEXA THORNCLAW DIKALAHKAN', W / 2, 78, '#ff9a2e', 1, 1);
+    textS('WAKTU: ' + fmtTime(playTime), W / 2, 100, '#ffffff', 2, 1);
+    textS('GUGUR: ' + deaths, W / 2, 118, '#ffffff', 2, 1);
+    textS('SENJATA BARU: THORN SHOT', W / 2, 140, '#ecc0ff', 1, 1);
+    textS('TERIMA KASIH SUDAH BERMAIN!', W / 2, 156, '#8ff5dc', 1, 1);
+    if (stateT > 90 && (frame >> 4) & 1) textS('ENTER: MAIN LAGI DENGAN THORN SHOT', W / 2, 180, '#ffffff', 1, 1);
+    return;
+  }
+  drawWorld();
+  if (state === 'pause') {
+    dim(0.6); textS('PAUSE', W / 2, 70, '#ffffff', 4, 1);
+    text('ENTER: LANJUT', W / 2, 104, '#8ff5dc', 1, 1);
+    text('PANAH/WASD GERAK - Z/SPASI LOMPAT - X TEMBAK', W / 2, 124, '#b9d8d0', 1, 1);
+    text('C/SHIFT DASH - Q/E SENJATA - M SUARA', W / 2, 133, '#b9d8d0', 1, 1);
+  } else if (state === 'gameover') {
+    dim(Math.min(0.7, stateT / 40)); textS('GAME OVER', W / 2, 72, '#ff5a3c', 4, 1);
+    if (stateT > 30 && (frame >> 4) & 1) textS(isTouch ? 'SENTUH: LANJUT DARI CHECKPOINT' : 'ENTER: LANJUT DARI CHECKPOINT', W / 2, 116, '#ffffff', 1, 1);
+  }
+}
+
+/* ---------------------------------------------------------------------
+   15. LOOP UTAMA: langkah tetap 60 FPS (stabil di layar 120/144 Hz)
+   --------------------------------------------------------------------- */
+buildLevel(); renderLevelCanvas(); renderBackgrounds();
+const STEP = 1000 / 60;
+let lastT = performance.now(), acc = 0;
+function loop(now) {
+  acc += Math.min(100, now - lastT); lastT = now;
+  let n = 0;
+  while (acc >= STEP && n < 5) { update(); acc -= STEP; n++; }
+  if (n === 5) acc = 0;
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// Akses untuk debugging/pengujian dari konsol
+window.GAME = {
+  get P() { return P; }, get boss() { return boss; }, get state() { return state; }, get cam() { return cam; },
+  get enemies() { return enemies; }, cps: () => cps, step: update, render
+};
+</script>
+</body>
+</html>
